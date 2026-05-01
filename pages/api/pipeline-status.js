@@ -1,30 +1,27 @@
-import { Pool } from 'pg';
-
-const pool = new Pool({
-  connectionString: process.env.NEON_DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
 export default async function handler(req, res) {
   try {
-    const result = await pool.query(`
-      SELECT status, last_run_time, rows_ingested 
-      FROM pipeline_status 
-      ORDER BY last_run_time DESC 
-      LIMIT 1
-    `);
-    
-    if (result.rows.length > 0) {
-      res.status(200).json(result.rows[0]);
-    } else {
-      throw new Error('No status found');
+    // Ping CoinGecko to check API reachability as a proxy for pipeline health
+    const start = Date.now();
+    const response = await fetch(
+      'https://api.coingecko.com/api/v3/ping',
+      { headers: { 'Accept': 'application/json', 'User-Agent': 'CryptoStream/1.0' } }
+    );
+    const latency = Date.now() - start;
+
+    if (!response.ok) {
+      throw new Error('CoinGecko unreachable');
     }
-  } catch (error) {
-    console.error('Error pipeline status, returning fallback:', error);
+
     res.status(200).json({
       status: 'healthy',
+      source: 'coingecko',
       last_run_time: new Date().toISOString(),
-      rows_ingested: 125430
+      latency_ms: latency,
+      rows_ingested: null,
+      note: 'Database not yet connected — live data sourced from CoinGecko.',
     });
+  } catch (error) {
+    console.error('Pipeline status check failed:', error);
+    res.status(500).json({ error: 'Pipeline status unavailable' });
   }
 }

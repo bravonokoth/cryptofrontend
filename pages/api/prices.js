@@ -1,36 +1,68 @@
-import { Pool } from 'pg';
-
-const pool = new Pool({
-  connectionString: process.env.NEON_DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+// Simple in-memory cache to avoid hitting CoinGecko rate limits (30 calls/min free tier)
+let cache = null;
+let cacheTime = 0;
+const CACHE_TTL_MS = 60 * 1000; // 60 seconds
 
 export default async function handler(req, res) {
+  const now = Date.now();
+
+  // Serve cached data if still fresh
+  if (cache && now - cacheTime < CACHE_TTL_MS) {
+    res.setHeader('X-Cache', 'HIT');
+    return res.status(200).json(cache);
+  }
+
   try {
-    // Assuming table `crypto_prices` or similar
-    const result = await pool.query(`
-      SELECT symbol, price, change_24h, volume_24h 
-      FROM crypto_prices 
-      ORDER BY volume_24h DESC NULLS LAST 
-      LIMIT 20
-    `);
-    
-    if (result.rows.length === 0) {
-      throw new Error('No data found');
+    const response = await fetch(
+      'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=20&page=1&sparkline=false&price_change_percentage=24h',
+      {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'CryptoStream/1.0',
+        },
+      }
+    );
+
+    if (!response.ok) {
+      // If rate limited but we have stale cache, serve it rather than erroring
+      if (response.status === 429 && cache) {
+        console.warn('CoinGecko rate limited — serving stale cache');
+        res.setHeader('X-Cache', 'STALE');
+        return res.status(200).json(cache);
+      }
+      throw new Error(`CoinGecko responded with ${response.status}`);
     }
-    
-    res.status(200).json(result.rows);
+
+    const json = await response.json();
+
+    const data = json.map(coin => ({
+      id: coin.id,
+      symbol: coin.symbol.toUpperCase(),
+      name: coin.name,
+      image: coin.image,
+      price: coin.current_price,
+      change_24h: coin.price_change_percentage_24h,
+      volume_24h: coin.total_volume,
+      market_cap: coin.market_cap,
+      rank: coin.market_cap_rank,
+    }));
+
+    // Update cache
+    cache = data;
+    cacheTime = now;
+
+    res.setHeader('X-Cache', 'MISS');
+    res.status(200).json(data);
   } catch (error) {
-    console.error('Error fetching prices from DB, returning mock data:', error);
-    // Return stunning fallback data
-    res.status(200).json([
-      { symbol: 'BTC', price: 65432.10, change_24h: 2.5, volume_24h: 32000000000 },
-      { symbol: 'ETH', price: 3456.78, change_24h: -1.2, volume_24h: 15400000000 },
-      { symbol: 'SOL', price: 145.20, change_24h: 5.6, volume_24h: 2100000000 },
-      { symbol: 'ADA', price: 0.45, change_24h: 0.5, volume_24h: 500000000 },
-      { symbol: 'DOT', price: 6.78, change_24h: -3.4, volume_24h: 300000000 },
-      { symbol: 'AVAX', price: 32.50, change_24h: 8.4, volume_24h: 420000000 },
-      { symbol: 'LINK', price: 14.80, change_24h: 1.1, volume_24h: 210000000 },
-    ]);
+    console.error('Error fetching prices:', error);
+
+    // If we have any cached data at all, serve it rather than failing
+    if (cache) {
+      console.warn('Serving stale cache after error');
+      res.setHeader('X-Cache', 'STALE');
+      return res.status(200).json(cache);
+    }
+
+    res.status(500).json({ error: 'Failed to fetch prices. Please try again shortly.' });
   }
 }
